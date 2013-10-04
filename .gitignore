@@ -1,0 +1,12 @@
+target/
+
+*.class
+
+# Package Files #
+*.jar
+*.war
+*.ear
+
+config
+dependency-reduced-pom.xml
+*~
