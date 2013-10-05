@@ -1,6 +1,6 @@
 MapsEngine.key=
 GTFS.path=/your/path/to/Amtrak_transit_feed.zip
-refreshInterval.vehicles=60
+refreshInterval.vehicles=300
 
 tripUpdates.url=http://localhost:9000/tripUpdates
 vehiclePositions.url=http://localhost:9000/vehiclePositions
