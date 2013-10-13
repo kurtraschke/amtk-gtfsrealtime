@@ -114,7 +114,7 @@ public class AMTKRealtimeMain {
         final CommandLine cli = parser.parse(options, args);
         Daemonizer.handleDaemonization(cli);
 
-        Set<Module> modules = new HashSet<Module>();
+        Set<Module> modules = new HashSet<>();
         AMTKRealtimeModule.addModuleAndDependencies(modules);
 
         _injector = Guice.createInjector(
@@ -122,16 +122,16 @@ public class AMTKRealtimeMain {
                 new FileConverter(),
                 new PropertiesConverter(),
                 new ConfigurationModule() {
-                    @Override
-                    protected void bindConfigurations() {
-                        bindEnvironmentVariables();
-                        bindSystemProperties();
+            @Override
+            protected void bindConfigurations() {
+                bindEnvironmentVariables();
+                bindSystemProperties();
 
-                        if (cli.hasOption(ARG_CONFIG_FILE)) {
-                            bindProperties(new File(cli.getOptionValue(ARG_CONFIG_FILE)));
-                        }
-                    }
-                },
+                if (cli.hasOption(ARG_CONFIG_FILE)) {
+                    bindProperties(new File(cli.getOptionValue(ARG_CONFIG_FILE)));
+                }
+            }
+        },
                 Rocoto.expandVariables(modules));
 
         _injector.injectMembers(this);

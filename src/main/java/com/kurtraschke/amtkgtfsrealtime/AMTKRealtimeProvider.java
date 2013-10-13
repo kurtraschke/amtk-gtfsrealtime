@@ -27,9 +27,7 @@ import com.google.transit.realtime.GtfsRealtime.VehiclePosition;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.URL;
-import java.text.DateFormat;
 import java.text.ParseException;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
@@ -38,7 +36,6 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.NoSuchElementException;
 import java.util.Set;
-import java.util.TimeZone;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -63,6 +60,10 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.transit.realtime.GtfsRealtime.Alert;
+import com.google.transit.realtime.GtfsRealtime.EntitySelector;
+import org.onebusaway.gtfs_realtime.exporter.GtfsRealtimeGuiceBindingTypes.Alerts;
+import org.onebusaway.gtfs_realtime.exporter.GtfsRealtimeLibrary;
 
 @Singleton
 public class AMTKRealtimeProvider {
@@ -71,7 +72,8 @@ public class AMTKRealtimeProvider {
     private ScheduledExecutorService _executor;
     private GtfsRealtimeSink _vehiclePositionsSink;
     private GtfsRealtimeSink _tripUpdatesSink;
-    private Map<String, Date> lastUpdateByVehicle = new HashMap<String, Date>();
+    private GtfsRealtimeSink _alertsSink;
+    private Map<String, Date> lastUpdateByVehicle = new HashMap<>();
     private GtfsDaoService _dao;
     /**
      * How often vehicle data will be downloaded, in seconds.
@@ -91,6 +93,11 @@ public class AMTKRealtimeProvider {
     @Inject
     public void setTripUpdateSink(@TripUpdates GtfsRealtimeSink sink) {
         _tripUpdatesSink = sink;
+    }
+
+    @Inject
+    public void setAlertsSink(@Alerts GtfsRealtimeSink sink) {
+        _alertsSink = sink;
     }
 
     @Inject
@@ -121,9 +128,6 @@ public class AMTKRealtimeProvider {
      * positions as a result.
      */
     private void refreshVehicles() throws IOException, ParseException {
-        /**
-         * We download the vehicle details as an array of objects.
-         */
         URL trainPositions = new URL("https://www.googleapis.com/mapsengine/v1/tables/01382379791355219452-08584582962951999356/features?version=published&maxResults=250&key=" + _mapsEngineKey);
 
         JsonParser parser = new JsonParser();
@@ -139,105 +143,136 @@ public class AMTKRealtimeProvider {
 
                 JsonObject trainProperties = train.getAsJsonObject("properties");
 
-                if (!trainProperties.get("TrainState").getAsString().equals("Active")) {
+                String trainState = trainProperties.get("TrainState").getAsString();
+
+                if (!(trainState.equals("Active")
+                        || trainState.equals("Predeparture"))) {
                     continue;
                 }
 
-
                 String trainNumber = trainProperties.get("TrainNum").getAsString();
-
-                String heading = trainProperties.get("Heading").getAsString();
-
-                float velocity = 0;
-                
-                if (trainProperties.has("Velocity") && !trainProperties.get("Velocity").getAsString().equals("")) {
-                     velocity = trainProperties.get("Velocity").getAsFloat();
-                }
 
                 String originTimestamp = trainProperties.get("OrigSchDep").getAsString();
                 String originTimezone = trainProperties.get("OriginTZ").getAsString();
 
                 String updateTimestamp = trainProperties.get("LastValTS").getAsString();
-                String updateTimezone = trainProperties.get("EventTZ").getAsString();
 
-                String key = originTimestamp + "-" + originTimezone + "-" + trainNumber;
+                String updateTimezone = trainProperties.has("EventTZ")
+                        ? trainProperties.get("EventTZ").getAsString() : originTimezone;
 
-                /**
-                 * We construct a TripDescriptor and VehicleDescriptor, which
-                 * will be used in both trip updates and vehicle positions to
-                 * identify the trip and vehicle.
-                 */
-                TripDescriptor.Builder tripDescriptor = TripDescriptor.newBuilder();
+                ServiceDate trainServiceDate = DateUtils.serviceDateForTimestamp(originTimestamp, originTimezone);
 
-                String tripId = tripForTrainAndDate(trainNumber, originTimestamp, originTimezone);
-                if (tripId == null) {
-                    continue;
-                }
+                String key = String.format("%s(%s)", trainNumber, trainServiceDate.getDay());
 
-                tripDescriptor.setTripId(tripId);
-                Date parsedServiceDate = parseTimestamp(originTimestamp, originTimezone);
-                ServiceDate serviceDate = new ServiceDate(parsedServiceDate);
-                tripDescriptor.setStartDate(String.format("%04d%02d%02d", serviceDate.getYear(), serviceDate.getMonth(), serviceDate.getDay()));
+                Date updateDate = DateUtils.parseTimestamp(updateTimestamp, updateTimezone);
 
+                if (!lastUpdateByVehicle.containsKey(key) || updateDate.after(lastUpdateByVehicle.get(key))) {
+                    long updateTime = updateDate.getTime() / 1000L;
 
-                VehicleDescriptor.Builder vehicleDescriptor = VehicleDescriptor.newBuilder();
-                vehicleDescriptor.setId(key);
-                vehicleDescriptor.setLabel(trainNumber);
+                    /**
+                     * We construct a TripDescriptor and VehicleDescriptor,
+                     * which will be used in both trip updates and vehicle
+                     * positions to identify the trip and vehicle.
+                     */
+                    TripDescriptor.Builder tripDescriptor = TripDescriptor.newBuilder();
 
-                TripUpdate.Builder tripUpdate = TripUpdate.newBuilder();
+                    String tripId = tripForTrainAndDate(trainNumber, trainServiceDate);
 
-                for (Entry<String, JsonElement> propEntry : trainProperties.entrySet()) {
-                    if (propEntry.getKey().startsWith("Station")) {
-                        StopTimeUpdate stu = stopTimeUpdateForStation(propEntry.getValue().getAsString());
-                        if (stu != null) {
-                            tripUpdate.addStopTimeUpdate(stu);
+                    if (tripId == null) {
+                        continue;
+                    }
+
+                    tripDescriptor.setTripId(tripId);
+                    tripDescriptor.setStartDate(String.format("%04d%02d%02d",
+                            trainServiceDate.getYear(), trainServiceDate.getMonth(), trainServiceDate.getDay()));
+
+                    VehicleDescriptor.Builder vehicleDescriptor = VehicleDescriptor.newBuilder();
+                    vehicleDescriptor.setId(key);
+                    vehicleDescriptor.setLabel(trainNumber);
+
+                    TripUpdate.Builder tripUpdate = TripUpdate.newBuilder();
+
+                    for (Entry<String, JsonElement> propEntry : trainProperties.entrySet()) {
+                        if (propEntry.getKey().startsWith("Station")) {
+                            StopTimeUpdate stu = stopTimeUpdateForStation(propEntry.getValue().getAsString());
+                            if (stu != null) {
+                                tripUpdate.addStopTimeUpdate(stu);
+                            }
                         }
                     }
+
+                    tripUpdate.setTrip(tripDescriptor);
+                    tripUpdate.setVehicle(vehicleDescriptor);
+                    tripUpdate.setTimestamp(updateTime);
+                    /**
+                     * Create a new feed entity to wrap the trip update and add
+                     * it to the GTFS-realtime trip updates feed.
+                     */
+                    FeedEntity.Builder tripUpdateEntity = FeedEntity.newBuilder();
+                    tripUpdateEntity.setId(key);
+                    tripUpdateEntity.setTripUpdate(tripUpdate);
+
+                    /**
+                     * To construct our VehiclePosition, we create a position
+                     * for the vehicle. We add the position to a VehiclePosition
+                     * builder, along with the trip and vehicle descriptors.
+                     */
+                    Position.Builder position = Position.newBuilder();
+                    position.setLatitude(coordinates.get(1).getAsFloat());
+                    position.setLongitude(coordinates.get(0).getAsFloat());
+
+                    if (trainProperties.has("Heading") && !trainProperties.get("Heading").getAsString().equals("")) {
+                        position.setBearing(degreesForHeading(trainProperties.get("Heading").getAsString()));
+                    }
+
+                    if (trainProperties.has("Velocity") && !trainProperties.get("Velocity").getAsString().equals("")) {
+                        position.setSpeed(trainProperties.get("Velocity").getAsFloat() * 0.44704f);
+                    }
+
+                    VehiclePosition.Builder vehiclePosition = VehiclePosition.newBuilder();
+                    vehiclePosition.setTimestamp(updateTime);
+                    vehiclePosition.setPosition(position);
+                    vehiclePosition.setTrip(tripDescriptor);
+                    vehiclePosition.setVehicle(vehicleDescriptor);
+
+                    /**
+                     * Create a new feed entity to wrap the vehicle position and
+                     * add it to the GTFS-realtime vehicle positions feed.
+                     */
+                    FeedEntity.Builder vehiclePositionEntity = FeedEntity.newBuilder();
+                    vehiclePositionEntity.setId(key);
+                    vehiclePositionEntity.setVehicle(vehiclePosition);
+
+                    GtfsRealtimeIncrementalUpdate tripUpdateUpdate = new GtfsRealtimeIncrementalUpdate();
+                    tripUpdateUpdate.addUpdatedEntity(tripUpdateEntity.build());
+                    _tripUpdatesSink.handleIncrementalUpdate(tripUpdateUpdate);
+
+                    GtfsRealtimeIncrementalUpdate vehiclePositionUpdate = new GtfsRealtimeIncrementalUpdate();
+                    vehiclePositionUpdate.addUpdatedEntity(vehiclePositionEntity.build());
+                    _vehiclePositionsSink.handleIncrementalUpdate(vehiclePositionUpdate);
+
+                    if (trainProperties.has("StatusMsg")) {
+                        String statusMessage = trainProperties.get("StatusMsg").getAsString().trim();
+                        Alert.Builder alert = Alert.newBuilder();
+
+                        alert.setDescriptionText(GtfsRealtimeLibrary.getTextAsTranslatedString(statusMessage));
+
+                        EntitySelector.Builder informedEntity = EntitySelector.newBuilder();
+                        informedEntity.setTrip(tripDescriptor);
+
+                        alert.addInformedEntity(informedEntity);
+
+                        FeedEntity.Builder alertEntity = FeedEntity.newBuilder();
+                        alertEntity.setId(key);
+                        alertEntity.setAlert(alert);
+
+                        GtfsRealtimeIncrementalUpdate alertUpdate = new GtfsRealtimeIncrementalUpdate();
+                        alertUpdate.addUpdatedEntity(alertEntity.build());
+                        _alertsSink.handleIncrementalUpdate(alertUpdate);
+                    }
+
+                    lastUpdateByVehicle.put(key, updateDate);
                 }
-
-                tripUpdate.setTrip(tripDescriptor);
-                tripUpdate.setVehicle(vehicleDescriptor);
-                tripUpdate.setTimestamp(parseTimestamp(updateTimestamp, updateTimezone).getTime() / 1000L);
-                /**
-                 * Create a new feed entity to wrap the trip update and add it
-                 * to the GTFS-realtime trip updates feed.
-                 */
-                FeedEntity.Builder tripUpdateEntity = FeedEntity.newBuilder();
-                tripUpdateEntity.setId(key);
-                tripUpdateEntity.setTripUpdate(tripUpdate);
-
-                /**
-                 * To construct our VehiclePosition, we create a position for
-                 * the vehicle. We add the position to a VehiclePosition
-                 * builder, along with the trip and vehicle descriptors.
-                 */
-                Position.Builder position = Position.newBuilder();
-                position.setLatitude(coordinates.get(1).getAsFloat());
-                position.setLongitude(coordinates.get(0).getAsFloat());
-                position.setBearing(degreesForHeading(heading));
-                position.setSpeed(velocity * 0.44704f);
-
-                VehiclePosition.Builder vehiclePosition = VehiclePosition.newBuilder();
-                vehiclePosition.setTimestamp(parseTimestamp(updateTimestamp, updateTimezone).getTime() / 1000L);
-                vehiclePosition.setPosition(position);
-                vehiclePosition.setTrip(tripDescriptor);
-                vehiclePosition.setVehicle(vehicleDescriptor);
-
-                /**
-                 * Create a new feed entity to wrap the vehicle position and add
-                 * it to the GTFS-realtime vehicle positions feed.
-                 */
-                FeedEntity.Builder vehiclePositionEntity = FeedEntity.newBuilder();
-                vehiclePositionEntity.setId(key);
-                vehiclePositionEntity.setVehicle(vehiclePosition);
-
-                GtfsRealtimeIncrementalUpdate tripUpdateUpdate = new GtfsRealtimeIncrementalUpdate();
-                tripUpdateUpdate.addUpdatedEntity(tripUpdateEntity.build());
-                _tripUpdatesSink.handleIncrementalUpdate(tripUpdateUpdate);
-
-                GtfsRealtimeIncrementalUpdate vehiclePositionUpdate = new GtfsRealtimeIncrementalUpdate();
-                vehiclePositionUpdate.addUpdatedEntity(vehiclePositionEntity.build());
-                _vehiclePositionsSink.handleIncrementalUpdate(vehiclePositionUpdate);
             } catch (Exception ex) {
                 _log.warn("Exception processing vehicle", ex);
             }
@@ -263,22 +298,7 @@ public class AMTKRealtimeProvider {
         }
     }
 
-    private TimeZone timeZoneForCode(String timeZoneCode) {
-        switch (timeZoneCode) {
-            case "E":
-                return TimeZone.getTimeZone("US/Eastern");
-            case "C":
-                return TimeZone.getTimeZone("US/Central");
-            case "M":
-                return TimeZone.getTimeZone("US/Mountain");
-            case "P":
-                return TimeZone.getTimeZone("US/Pacific");
-            default:
-                throw new IllegalArgumentException("Unknown timezone: " + timeZoneCode);
-        }
-    }
-
-    private int degreesForHeading(String heading) {
+    private static int degreesForHeading(String heading) {
         switch (heading) {
             case "N":
                 return 0;
@@ -301,10 +321,7 @@ public class AMTKRealtimeProvider {
         }
     }
 
-    private String tripForTrainAndDate(final String trainNumber, String originTimestamp, String originTimezone) throws ParseException {
-        Date parsedServiceDate = parseTimestamp(originTimestamp, originTimezone);
-        ServiceDate serviceDate = new ServiceDate(parsedServiceDate);
-
+    private String tripForTrainAndDate(final String trainNumber, ServiceDate serviceDate) {
         Set<AgencyAndId> serviceIds = _dao.getCalendarServiceData().getServiceIdsForDate(serviceDate);
 
         List<Iterable<Trip>> trips = new ArrayList<>();
@@ -325,38 +342,16 @@ public class AMTKRealtimeProvider {
                 }
             });
         } catch (NoSuchElementException ex) {
-            _log.warn("Could not find train " + trainNumber + " departing on date " + serviceDate.toString());
+            _log.warn("Could not find train " + trainNumber + " departing on date " + serviceDate.getAsString());
             return null;
         }
 
         return theTrip.getId().getId();
-
-    }
-
-    private Date parseTimestamp(String timestamp, String timezone) throws ParseException {
-        // 10/4/2013 10:00:34 AM
-        TimeZone tz = timeZoneForCode(timezone);
-
-        DateFormat sdf = new SimpleDateFormat("M/d/y h:m:s a");
-        sdf.setTimeZone(tz);
-
-        return sdf.parse(timestamp);
-    }
-
-    private Date parseStopTime(String timestamp, String timezone) throws ParseException {
-        // 10/03/2013 04:33:00
-        TimeZone tz = timeZoneForCode(timezone);
-
-        DateFormat sdf = new SimpleDateFormat("M/d/y H:m:s");
-        sdf.setTimeZone(tz);
-
-        return sdf.parse(timestamp);
     }
 
     private StopTimeUpdate stopTimeUpdateForStation(String stationJson) throws ParseException {
         JsonParser parser = new JsonParser();
         JsonObject o = (JsonObject) parser.parse(stationJson);
-
 
         StopTimeUpdate.Builder b = StopTimeUpdate.newBuilder();
 
@@ -365,23 +360,27 @@ public class AMTKRealtimeProvider {
         if (o.has("postarr") && o.has("postdep")) {
 
             StopTimeEvent.Builder arr = StopTimeEvent.newBuilder();
-            arr.setTime(parseStopTime(o.get("postarr").getAsString(), o.get("tz").getAsString()).getTime() / 1000L);
+            arr.setTime(DateUtils.parseStopTime(o.get("postarr").getAsString(),
+                    o.get("tz").getAsString()).getTime() / 1000L);
 
             StopTimeEvent.Builder dep = StopTimeEvent.newBuilder();
-            dep.setTime(parseStopTime(o.get("postdep").getAsString(), o.get("tz").getAsString()).getTime() / 1000L);
+            dep.setTime(DateUtils.parseStopTime(o.get("postdep").getAsString(),
+                    o.get("tz").getAsString()).getTime() / 1000L);
 
             b.setArrival(arr);
             b.setDeparture(dep);
 
         } else if (o.has("estarr")) {
             StopTimeEvent.Builder arr = StopTimeEvent.newBuilder();
-            arr.setTime(parseStopTime(o.get("estarr").getAsString(), o.get("tz").getAsString()).getTime() / 1000L);
+            arr.setTime(DateUtils.parseStopTime(o.get("estarr").getAsString(),
+                    o.get("tz").getAsString()).getTime() / 1000L);
 
             b.setArrival(arr);
 
             if (o.has("estdep")) {
                 StopTimeEvent.Builder dep = StopTimeEvent.newBuilder();
-                dep.setTime(parseStopTime(o.get("estdep").getAsString(), o.get("tz").getAsString()).getTime() / 1000L);
+                dep.setTime(DateUtils.parseStopTime(o.get("estdep").getAsString(),
+                        o.get("tz").getAsString()).getTime() / 1000L);
 
                 b.setDeparture(dep);
             }
